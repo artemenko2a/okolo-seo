@@ -1,0 +1,11 @@
+# Локальный конфиг и данные — не для публичного репозитория
+.env
+cache/*.json
+
+# Python
+__pycache__/
+*.pyc
+
+# На случай, если credentials по ошибке окажутся прямо в папке скилла
+client_secret.json
+token.json
