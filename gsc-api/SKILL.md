@@ -170,6 +170,34 @@ by_news_showcase_panel, по умолчанию auto), `--row-limit` (пагин
 `--limit`/`--top` ограничивают только то, что печатается в консоль, на CSV не влияют),
 `--refresh` (игнорировать кэш).
 
+## Грабли: Git Bash манглит значения с ведущим `/`
+
+Если вызываешь `gsc.py` через Git Bash (MSYS2) на Windows, значение флага,
+**начинающееся с `/`** (например `--page-contains /episodes/123`), MSYS2 молча
+подменяет на Windows-путь вида `C:/Program Files/Git/episodes/123` ещё до того,
+как Python увидит argv — оператор `contains` в этом случае корректно не находит
+такую подстроку и возвращает 0 строк. Это не баг API и не баг `gsc.py` —
+маппинг операторов (`contains`/`notContains`/`includingRegex`/`excludingRegex`)
+соответствует [официальной документации `searchanalytics.query`](https://developers.google.com/webmaster-tools/v1/searchanalytics/query).
+
+Проверить, манглится ли конкретный вызов:
+```
+python -c "import sys; print(sys.argv)" --page-contains /episodes/123
+```
+Если во втором элементе списка не `/episodes/123`, а что-то вроде
+`C:/Program Files/Git/episodes/123` — значение заманглено.
+
+Обход (любой один из вариантов):
+- `MSYS_NO_PATHCONV=1 python gsc.py query ...` — отключает конвертацию для вызова
+- Вызывать через PowerShell вместо Git Bash — там этой конвертации нет
+- Убрать ведущий `/` из значения (`--page-contains episodes/123` вместо
+  `/episodes/123`) — `contains` ищет подстроку без привязки к началу строки,
+  результат тот же
+- Использовать `--filter page:contains:episodes/123` или значение, не
+  начинающееся с `/` целиком (например `--page-equals https://...` или
+  `--filter "page:regex:/episodes/123"`) — такие аргументы MSYS2 не трогает,
+  так как они не начинаются с `/`
+
 ## Кэш — чтобы не жечь лимиты API
 
 Каждый запрос (`query`/`compare`/`groups`/`inspect`) кэшируется в `cache\` рядом с этим файлом,
