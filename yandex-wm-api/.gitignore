@@ -1,0 +1,8 @@
+# Local config and data — not for the public repo
+.env
+cache/
+local/
+
+# Python
+__pycache__/
+*.pyc
