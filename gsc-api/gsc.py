@@ -38,6 +38,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 HOME = Path(__file__).resolve().parent
 CACHE_DIR = HOME / "cache"
 CACHE_MAX_AGE_DAYS = 30
+CACHE_VERSION = 2  # поднимать, когда меняется смысл закэшированных строк
 SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
 GSC_ROW_LIMIT = 25000  # лимит GSC API — максимум строк за один вызов searchanalytics.query
 
@@ -183,9 +184,11 @@ _DIMENSION_ALIASES = {
     "country": "country",
     "device": "device",
     "searchappearance": "searchAppearance",
+    "brandedclassification": "brandedClassification",
 }
 _VALID_DIMENSIONS = sorted(set(_DIMENSION_ALIASES.values()) | {"date", "hour"})
 _DEVICE_VALUES = ("MOBILE", "DESKTOP", "TABLET")
+_BRAND_VALUES = ("BRANDED", "NON_BRANDED")
 
 # (dimension, operator, argparse-dest, help) — единый источник и для регистрации
 # флагов в _add_filter_args, и для сборки фильтров в build_filter_groups.
@@ -196,6 +199,7 @@ _NAMED_FILTERS = [
     ("query", "contains", "query_contains", "Запрос содержит подстроку"),
     ("country", "equals", "country", "3-буквенный код страны, напр. rus"),
     ("device", "equals", "device", "MOBILE / DESKTOP / TABLET"),
+    ("brandedClassification", "equals", "brand", "branded / non_branded — классификация запросов самим Google"),
 ]
 
 
@@ -210,6 +214,10 @@ def _make_filter(dimension, operator, expression):
         expression = expression.upper()
         if expression not in _DEVICE_VALUES:
             raise SystemExit(f"--device: недопустимое значение {expression!r}. Допустимо: {', '.join(_DEVICE_VALUES)}")
+    if dimension == "brandedClassification":
+        expression = expression.upper()
+        if expression not in _BRAND_VALUES or operator != "equals":
+            raise SystemExit("brandedClassification: API принимает только equals и значения branded / non_branded")
     return {"dimension": dimension, "operator": operator, "expression": expression}
 
 
@@ -258,34 +266,65 @@ def build_extra_body(args):
 # --------------------------------------------------------------------------- query
 
 def _normalize_page(value):
-    """GSC репортит #anchor-варианты одной страницы как разные значения page —
-    схлопываем их в одно (без #fragment), иначе они дают ложные срабатывания и в
-    поиске каннибализации (groups), и в сравнении периодов (compare)."""
     return value.split("#", 1)[0]
 
 
 def _merge_page_duplicates(records, dimensions):
-    """Схлопывает записи, совпадающие по всем dimensions после нормализации page,
-    суммируя clicks/impressions и пересчитывая ctr/position (impressions-взвешенно)."""
+    """Схлопывает #-варианты страницы (jump-ссылки «перейти к разделу») в основной URL.
+    Jump-ссылка показывается внутри результата основного URL: клики складываются,
+    показы и позиция берутся у варианта с наибольшими показами (это основной URL)."""
     if "page" not in dimensions:
         return records
     merged = {}
-    for r in records:
+    for r in sorted(records, key=lambda r: "#" in r["page"]):  # основные URL первыми
         r = {**r, "page": _normalize_page(r["page"])}
         key = tuple(r[d] for d in dimensions)
         m = merged.get(key)
         if m is None:
             merged[key] = r
             continue
-        total_impressions = m["impressions"] + r["impressions"]
-        if total_impressions:
-            m["position"] = round(
-                (m["position"] * m["impressions"] + r["position"] * r["impressions"]) / total_impressions, 1,
-            )
         m["clicks"] += r["clicks"]
-        m["impressions"] = total_impressions
-        m["ctr"] = round(m["clicks"] / total_impressions * 100, 2) if total_impressions else 0
+        if r["impressions"] > m["impressions"]:
+            m["impressions"], m["position"] = r["impressions"], r["position"]
+        m["ctr"] = round(m["clicks"] / m["impressions"] * 100, 2) if m["impressions"] else 0
     return list(merged.values())
+
+
+def _rollup(records, dimensions):
+    """Складывает строки до разреза dimensions (позиция — средняя, взвешенная по показам)."""
+    totals = defaultdict(lambda: [0, 0, 0.0])
+    for r in records:
+        t = totals[tuple(r[d] for d in dimensions)]
+        t[0] += r["clicks"]
+        t[1] += r["impressions"]
+        t[2] += r["position"] * r["impressions"]
+    return [
+        {**dict(zip(dimensions, key)), "clicks": c, "impressions": i,
+         "ctr": round(c / i * 100, 2) if i else 0, "position": round(p / i, 1) if i else 0}
+        for key, (c, i, p) in totals.items()
+    ]
+
+
+def _needs_page_expansion(dimensions, extra_body):
+    """Ответ агрегирован по страницам, а page в разрезе нет: API сам сложит показы
+    #-вариантов с основным URL, поэтому запрашиваем с page и схлопываем у себя."""
+    if "page" in dimensions or "searchAppearance" in dimensions:
+        return False
+    extra_body = extra_body or {}
+    groups = extra_body.get("dimensionFilterGroups") or []
+    has_page_filter = any(f["dimension"] == "page" for g in groups for f in g["filters"])
+    return has_page_filter or extra_body.get("aggregationType") == "BY_PAGE"
+
+
+def _has_fragment_pages(service, site_url, start_date, end_date, dimensions, extra_body):
+    """Есть ли под теми же фильтрами хоть один URL с # (один дешёвый запрос; разрез тот же
+    плюс page — например, hourly_all принимается только с hour)."""
+    body = {**(extra_body or {}), "startDate": start_date, "endDate": end_date,
+            "dimensions": dimensions + ["page"], "rowLimit": 1}
+    fragment = {"dimension": "page", "operator": "contains", "expression": "#"}
+    groups = body.get("dimensionFilterGroups") or [{"filters": []}]
+    body["dimensionFilterGroups"] = [{**g, "filters": g["filters"] + [fragment]} for g in groups]
+    return bool(service.searchanalytics().query(siteUrl=site_url, body=body).execute().get("rows"))
 
 
 def fetch_search_analytics(service, site_url, start_date, end_date, dimensions,
@@ -328,23 +367,46 @@ def fetch_search_analytics(service, site_url, start_date, end_date, dimensions,
             "position": round(row.get("position", 0), 1),
         })
         records.append(record)
-    return _merge_page_duplicates(records, dimensions)
+    return records
 
 
-def run_query(site, start, end, dimensions, extra_body=None, row_limit=GSC_ROW_LIMIT, refresh=False):
-    """Список dict-записей за период. Кэшируется по точному набору параметров
-    (включая фильтры, searchType, dataState, aggregationType). row_limit — размер
-    страницы пагинации, на итоговый набор данных не влияет, поэтому в ключ кэша
-    не входит."""
-    identity = {"site": site, "start": start, "end": end, "dimensions": dimensions, "extra": extra_body}
+def _fetch_raw(site, start, end, dimensions, extra_body, row_limit, max_rows=200000):
+    """Сырые строки API (без схлопывания #) и разрез, с которым они запрошены."""
+    service = get_service()
+    if (_needs_page_expansion(dimensions, extra_body)
+            and _has_fragment_pages(service, site, start, end, dimensions, extra_body)):
+        dims = dimensions + ["page"]
+        rows = fetch_search_analytics(service, site, start, end, dims, row_limit=row_limit,
+                                      max_rows=max_rows, extra_body=extra_body)
+        if len(rows) < max_rows:
+            return {"dimensions": dims, "rows": rows}
+        print("[warn] с разрезом page строк слишком много — беру ответ API как есть, "
+              "показы #-ссылок в нём сложены с основным URL", file=sys.stderr)
+    rows = fetch_search_analytics(service, site, start, end, dimensions, row_limit=row_limit,
+                                  max_rows=max_rows, extra_body=extra_body)
+    return {"dimensions": dimensions, "rows": rows}
+
+
+def run_query(site, start, end, dimensions, extra_body=None, row_limit=GSC_ROW_LIMIT, refresh=False,
+              keep_fragments=False):
+    """Список dict-записей за период. В кэше — сырые строки API, #-варианты страниц
+    схлопываются при чтении (keep_fragments=True — оставить как есть). Ключ кэша —
+    точный набор параметров; row_limit (размер страницы пагинации) в него не входит."""
+    identity = {"v": CACHE_VERSION, "site": site, "start": start, "end": end,
+                "dimensions": dimensions, "extra": extra_body}
     key = _cache_key(**identity)
 
-    records, from_cache = _cache_or_fetch(
-        key, refresh,
-        lambda: fetch_search_analytics(get_service(), site, start, end, dimensions,
-                                        row_limit=row_limit, extra_body=extra_body),
-        identity,
+    data, from_cache = _cache_or_fetch(
+        key, refresh, lambda: _fetch_raw(site, start, end, dimensions, extra_body, row_limit), identity,
     )
+    records = data["rows"]
+    if not keep_fragments:
+        records = _merge_page_duplicates(records, data["dimensions"])
+    if data["dimensions"] != dimensions:
+        records = _rollup(records, dimensions)
+        if not keep_fragments:
+            print("[pages] под фильтром есть URL с #: запрошено с разрезом page, #-ссылки схлопнуты "
+                  "(--keep-fragments — как отдаёт API)", file=sys.stderr)
     tag, verb = ("cache", "строк из кэша") if from_cache else ("api", "строк получено и закэшировано")
     print(f"[{tag}] {len(records)} {verb} ({key})", file=sys.stderr)
     return records
@@ -430,7 +492,7 @@ def cmd_query(args):
     extra_body = build_extra_body(args)
     records = run_query(args.site, args.start, args.end, args.dimensions,
                          extra_body=extra_body, row_limit=args.row_limit,
-                         refresh=args.refresh)
+                         refresh=args.refresh, keep_fragments=args.keep_fragments)
     records = apply_numeric_filters(records, args)
     records.sort(key=lambda r: r.get(args.sort_by, 0), reverse=not args.sort_asc)
     print_table(records, csv_path=args.csv, limit=args.limit)
@@ -443,10 +505,10 @@ def cmd_compare(args):
     extra_body = build_extra_body(args)
     dims = args.dimensions
 
-    a = run_query(args.site, args.period_a_start, args.period_a_end, dims,
-                  extra_body=extra_body, row_limit=args.row_limit, refresh=args.refresh)
-    b = run_query(args.site, args.period_b_start, args.period_b_end, dims,
-                  extra_body=extra_body, row_limit=args.row_limit, refresh=args.refresh)
+    a = run_query(args.site, args.period_a_start, args.period_a_end, dims, extra_body=extra_body,
+                  row_limit=args.row_limit, refresh=args.refresh, keep_fragments=args.keep_fragments)
+    b = run_query(args.site, args.period_b_start, args.period_b_end, dims, extra_body=extra_body,
+                  row_limit=args.row_limit, refresh=args.refresh, keep_fragments=args.keep_fragments)
 
     a_by_key = {tuple(r[d] for d in dims): r for r in a}
     b_by_key = {tuple(r[d] for d in dims): r for r in b}
@@ -481,8 +543,8 @@ def cmd_groups(args):
     if not other_dims:
         raise SystemExit("--dimensions должен содержать хотя бы одно измерение, кроме --group-by")
 
-    records = run_query(args.site, args.start, args.end, dims,
-                         extra_body=extra_body, row_limit=args.row_limit, refresh=args.refresh)
+    records = run_query(args.site, args.start, args.end, dims, extra_body=extra_body,
+                         row_limit=args.row_limit, refresh=args.refresh, keep_fragments=args.keep_fragments)
 
     groups = defaultdict(lambda: {"clicks": 0, "impressions": 0, "members": set()})
     for r in records:
@@ -533,8 +595,8 @@ def cmd_sitemaps(args):
             "errors": s.get("errors"),
         }
         for c in s.get("contents") or [{}]:
-            rows.append({**base, "content_type": c.get("type"),
-                         "submitted": c.get("submitted"), "indexed": c.get("indexed")})
+            # contents[].indexed в API устарело (deprecated) и приходит 0 — не выводим
+            rows.append({**base, "content_type": c.get("type"), "submitted": c.get("submitted")})
     print_table(rows, csv_path=args.csv)
 
 
@@ -596,13 +658,18 @@ def _add_filter_args(p):
         p.add_argument(f"--{attr.replace('_', '-')}", help=help_text)
     p.add_argument("--filter", action="append", metavar="DIM:OP:EXPR",
                     help="Произвольный фильтр, можно указывать несколько раз. "
-                         "DIM = query|page|country|device|searchAppearance. "
+                         "DIM = query|page|country|device|searchAppearance|brandedClassification. "
                          "OP = equals|not_equals|contains|not_contains|regex|not_regex "
-                         "(regex/not_regex — RE2, includingRegex/excludingRegex в терминах API). "
+                         "(regex/not_regex — RE2, includingRegex/excludingRegex в терминах API; "
+                         "у brandedClassification только equals). "
                          "Пример: --filter query:not_contains:brand-name "
                          "--filter page:regex:/episodes/\\d+$")
-    p.add_argument("--search-type", choices=["web", "image", "video", "news", "discover", "google_news"],
-                    help="Тип поиска (по умолчанию web). discover/google_news — трафик из Google Discover / Google News")
+    p.add_argument("--search-type",
+                    choices=["web", "image", "video", "news", "discover", "google_news", "web_multimodal"],
+                    help="Тип поиска (по умолчанию web). discover/google_news — трафик из Google Discover / Google News; "
+                         "web_multimodal — без разреза и фильтра по query и без brandedClassification")
+    p.add_argument("--keep-fragments", action="store_true",
+                    help="Не схлопывать #-варианты страниц (jump-ссылки): каждый URL с # отдельной строкой")
     p.add_argument("--data-state", choices=["final", "all", "hourly_all"],
                     help="final — только финализированные данные (по умолчанию, задержка ~2-3 дня); "
                          "all — включая свежие неполные данные за последние дни; "
@@ -627,7 +694,7 @@ def main():
     q.add_argument("--start", required=True)
     q.add_argument("--end", required=True)
     q.add_argument("--dimensions", nargs="+", required=True, choices=_VALID_DIMENSIONS,
-                   help="query, page, country, device, date, searchAppearance, "
+                   help="query, page, country, device, date, searchAppearance, brandedClassification, "
                         "hour (только с --data-state hourly_all)")
     q.add_argument("--limit", type=int, default=50,
                    help="Сколько строк показать в консоли после сортировки (не влияет на --csv — там всегда полный результат)")
@@ -693,7 +760,11 @@ def main():
         sys.exit(1)
 
     _prune_cache()
-    args.func(args)
+    from googleapiclient.errors import HttpError
+    try:
+        args.func(args)
+    except HttpError as e:
+        raise SystemExit(f"[api error {e.status_code}] {e.reason}")
 
 
 if __name__ == "__main__":
